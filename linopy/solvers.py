@@ -14,6 +14,7 @@ import re
 import subprocess as sub
 import sys
 import threading
+import time
 import warnings
 from abc import ABC, abstractmethod
 from collections import namedtuple
@@ -1604,16 +1605,23 @@ class Xpress(Solver[None]):
         env: None = None,
         explicit_coordinate_names: bool = False,
     ) -> Result:
-        m = model.to_xpress(explicit_coordinate_names=explicit_coordinate_names)
-        print_variable, print_constraint = linopy.io.get_printers_scalar(
-            model, explicit_coordinate_names=explicit_coordinate_names
+        variable_names: np.ndarray | None = None
+        constraint_names: np.ndarray | None = None
+        if not explicit_coordinate_names:
+            matrices = model.matrices
+            variable_names = np.asarray(matrices.vlabels)
+            constraint_names = np.asarray(matrices.clabels)
+
+        build_start = time.perf_counter()
+        logger.info(" Start building Xpress direct model")
+        m = model.to_xpress(
+            explicit_coordinate_names=explicit_coordinate_names,
+            progress=None,
         )
-        variable_names = np.vectorize(print_variable)(model.matrices.vlabels).astype(
-            object
+        logger.info(
+            " Finished building Xpress direct model in %.3fs",
+            time.perf_counter() - build_start,
         )
-        constraint_names = np.vectorize(print_constraint)(
-            model.matrices.clabels
-        ).astype(object)
 
         return self._solve(
             m=m,
@@ -1716,7 +1724,12 @@ class Xpress(Solver[None]):
             except AttributeError:  # Fallback to old API
                 m.readbasis(path_to_string(warmstart_fn))
 
+        optimize_start = time.perf_counter()
+        logger.info(" Start Xpress optimize()")
         m.optimize()
+        logger.info(
+            " Finished Xpress optimize() in %.3fs", time.perf_counter() - optimize_start
+        )
 
         # if the solver is stopped (timelimit for example), postsolve the problem
         if m.attributes.solvestatus == xpress.enums.SolveStatus.STOPPED:

@@ -283,6 +283,27 @@ def test_to_xpress_loadmiqp(monkeypatch: pytest.MonkeyPatch) -> None:
     miqp_kwargs = call_map["loadMIQP"]
     assert miqp_kwargs["entind"] is not None
     assert miqp_kwargs["objqcoef"] is not None
+    assert "addNames" not in call_map
+
+
+def test_to_xpress_progress_logging(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake_xpress(monkeypatch)
+    messages: list[str] = []
+
+    def _log_info(msg: str, *args: object, **kwargs: object) -> None:
+        messages.append(msg % args if args else msg)
+
+    monkeypatch.setattr("linopy.io.logger.info", _log_info)
+
+    m = Model()
+    x = m.add_variables(lower=0, upper=10, coords=[range(3)], name="x")
+    m.add_constraints(x.sum(), LESS_EQUAL, 10, name="c")
+    m.add_objective((2 * x).sum())
+
+    to_xpress(m, progress=True)
+
+    assert any("prepared linear constraint matrix" in msg for msg in messages)
+    assert any("finished direct model build" in msg for msg in messages)
 
 
 def test_to_blocks(tmp_path: Path) -> None:

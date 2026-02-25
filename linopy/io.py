@@ -8,6 +8,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import shutil
+import sys
 import time
 import warnings
 from collections.abc import Callable
@@ -837,7 +838,9 @@ def to_highspy(m: Model, explicit_coordinate_names: bool = False) -> Highs:
     return h
 
 
-def to_xpress(m: Model, explicit_coordinate_names: bool = False) -> Any:
+def to_xpress(
+    m: Model, explicit_coordinate_names: bool = False, progress: bool | None = None
+) -> Any:
     """
     Export the model to xpress using native array-loading APIs.
 
@@ -846,12 +849,36 @@ def to_xpress(m: Model, explicit_coordinate_names: bool = False) -> Any:
     """
     import xpress
 
-    print_variable, print_constraint = get_printers_scalar(
-        m, explicit_coordinate_names=explicit_coordinate_names
-    )
+    if progress is None:
+        progress = m._xCounter > 10_000
+
+    def _name_array(labels: np.ndarray, formatter: Callable[[Any], str]) -> np.ndarray:
+        flat_labels = labels.ravel()
+        return np.fromiter(
+            (formatter(label) for label in flat_labels),
+            dtype=object,
+            count=flat_labels.size,
+        )
 
     M = m.matrices
+    t_start = time.perf_counter()
+    t_stage = t_start
     problem = xpress.problem()
+
+    def _emit_progress_message(message: str) -> None:
+        if not progress:
+            return
+        logger.info(message)
+        sys.stderr.write(f"{message}\n")
+        sys.stderr.flush()
+
+    _emit_progress_message(
+        " Xpress direct IO: building model "
+        f"(nvars={len(M.vlabels)}, ncons={len(M.clabels)}, "
+        f"annz={int(M.A.nnz) if M.A is not None else 0}, "
+        f"qnnz={int(M.Q.nnz) if M.Q is not None else 0}, "
+        f"explicit_names={explicit_coordinate_names})"
+    )
 
     def call_xpress(new_api: str, old_api: str, **kwargs: Any) -> None:
         try:
@@ -859,153 +886,210 @@ def to_xpress(m: Model, explicit_coordinate_names: bool = False) -> Any:
         except AttributeError:
             getattr(problem, old_api)(**kwargs)
 
-    A = M.A
-    if A is not None and A.nnz:
-        A = A.tocsc()
-        start = A.indptr.astype(np.int64)
-        rowind = A.indices.astype(np.int64)
-        rowcoef = A.data.astype(float)
-    else:
-        start = None
-        rowind = None
-        rowcoef = None
-
-    lb = np.where(np.isneginf(M.lb), -xpress.infinity, M.lb)
-    ub = np.where(np.isposinf(M.ub), xpress.infinity, M.ub)
-
-    if len(M.clabels):
-        row_type_map = {"<": "L", ">": "G", "=": "E"}
-        rowtype = np.vectorize(row_type_map.get)(M.sense)
-        rhs = M.b
-    else:
-        rowtype = None
-        rhs = None
-
-    Q = M.Q
-    objqcol1: np.ndarray | None
-    objqcol2: np.ndarray | None
-    objqcoef: np.ndarray | None
-    if Q is not None and Q.nnz:
-        Qt = triu(Q).tocoo()
-        objqcol1 = Qt.row.astype(np.int64)
-        objqcol2 = Qt.col.astype(np.int64)
-        objqcoef = Qt.data.astype(float)
-    else:
-        objqcol1 = None
-        objqcol2 = None
-        objqcoef = None
-
-    is_mip = bool(np.any((M.vtypes == "B") | (M.vtypes == "I")))
-
-    if is_mip:
-        entind = np.flatnonzero((M.vtypes == "B") | (M.vtypes == "I")).astype(np.int64)
-        coltype = M.vtypes[entind]
-        call_xpress(
-            "loadMIQP",
-            "loadmiqp",
-            probname="",
-            rowtype=rowtype,
-            rhs=rhs,
-            rng=None,
-            objcoef=M.c,
-            start=start,
-            collen=None,
-            rowind=rowind,
-            rowcoef=rowcoef,
-            lb=lb,
-            ub=ub,
-            objqcol1=objqcol1,
-            objqcol2=objqcol2,
-            objqcoef=objqcoef,
-            coltype=coltype,
-            entind=entind,
-            limit=None,
-            settype=None,
-            setstart=None,
-            setind=None,
-            refval=None,
+    def _log_stage(stage: str, detail: str = "") -> None:
+        if not progress:
+            return
+        nonlocal t_stage
+        now = time.perf_counter()
+        msg = (
+            f" Xpress direct IO: {stage} ({now - t_stage:.3f}s stage, "
+            f"{now - t_start:.3f}s total)"
         )
-    elif objqcoef is not None:
-        call_xpress(
-            "loadQP",
-            "loadqp",
-            probname="",
-            rowtype=rowtype,
-            rhs=rhs,
-            rng=None,
-            objcoef=M.c,
-            start=start,
-            collen=None,
-            rowind=rowind,
-            rowcoef=rowcoef,
-            lb=lb,
-            ub=ub,
-            objqcol1=objqcol1,
-            objqcol2=objqcol2,
-            objqcoef=objqcoef,
-        )
-    else:
-        call_xpress(
-            "loadLP",
-            "loadlp",
-            probname="",
-            rowtype=rowtype,
-            rhs=rhs,
-            rng=None,
-            objcoef=M.c,
-            start=start,
-            collen=None,
-            rowind=rowind,
-            rowcoef=rowcoef,
-            lb=lb,
-            ub=ub,
-        )
+        if detail:
+            msg = f"{msg} {detail}"
+        _emit_progress_message(msg)
+        t_stage = now
 
-    if m.objective.sense == "max":
-        changed_sense = False
-        with contextlib.suppress(AttributeError):
-            problem.chgObjSense(xpress.ObjSense.MAXIMIZE)
-            changed_sense = True
-        if not changed_sense:
-            with contextlib.suppress(AttributeError):
-                problem.chgobjsense(xpress.maximize)
+    try:
+        A = M.A
+        if A is not None and A.nnz:
+            if A.format != "csc":
+                A = A.tocsc()
+            start = A.indptr.astype(np.int64, copy=False)
+            rowind = A.indices.astype(np.int64, copy=False)
+            rowcoef = A.data.astype(float, copy=False)
+        else:
+            start = None
+            rowind = None
+            rowcoef = None
 
-    row_namespace = getattr(getattr(xpress, "Namespaces", None), "ROW", 1)
-    col_namespace = getattr(getattr(xpress, "Namespaces", None), "COLUMN", 2)
+        _log_stage("prepared linear constraint matrix")
 
-    col_names = np.vectorize(print_variable)(M.vlabels).astype(object).tolist()
-    if col_names:
-        try:
-            problem.addNames(col_namespace, col_names, 0, len(col_names) - 1)
-        except AttributeError:
-            problem.addnames(col_namespace, col_names, 0, len(col_names) - 1)
+        lb = np.asarray(M.lb, dtype=float)
+        ub = np.asarray(M.ub, dtype=float)
 
-    row_names = np.vectorize(print_constraint)(M.clabels).astype(object).tolist()
-    if row_names:
-        try:
-            problem.addNames(row_namespace, row_names, 0, len(row_names) - 1)
-        except AttributeError:
-            problem.addnames(row_namespace, row_names, 0, len(row_names) - 1)
+        lb_inf = np.isneginf(lb)
+        if lb_inf.any():
+            lb = lb.copy()
+            lb[lb_inf] = -xpress.infinity
 
-    if m.variables.sos:
-        for var_name in m.variables.sos:
-            var = m.variables.sos[var_name]
-            sos_type: int = var.attrs[SOS_TYPE_ATTR]  # type: ignore[assignment]
-            sos_dim: str = var.attrs[SOS_DIM_ATTR]  # type: ignore[assignment]
+        ub_inf = np.isposinf(ub)
+        if ub_inf.any():
+            ub = ub.copy()
+            ub[ub_inf] = xpress.infinity
 
-            def add_sos(s: xr.DataArray, sos_type: int, sos_dim: str) -> None:
-                s = s.squeeze()
-                indices = s.values.astype(np.int64).flatten().tolist()
-                weights = s.coords[sos_dim].values.tolist()
-                problem.addSOS(indices, weights, type=sos_type)
+        _log_stage("prepared variable bounds")
 
-            others = [dim for dim in var.labels.dims if dim != sos_dim]
-            if not others:
-                add_sos(var.labels, sos_type, sos_dim)
+        if len(M.clabels):
+            rowtype = np.full(M.sense.shape, "E", dtype="U1")
+            rowtype[M.sense == "<"] = "L"
+            rowtype[M.sense == ">"] = "G"
+            rhs = M.b
+        else:
+            rowtype = None
+            rhs = None
+
+        _log_stage("prepared row senses and rhs")
+
+        Q = M.Q
+        objqcol1: np.ndarray | None
+        objqcol2: np.ndarray | None
+        objqcoef: np.ndarray | None
+        if Q is not None and Q.nnz:
+            if Q.format == "coo":  # codespell:ignore coo
+                mask = Q.row <= Q.col
+                objqcol1 = Q.row[mask].astype(np.int64, copy=False)
+                objqcol2 = Q.col[mask].astype(np.int64, copy=False)
+                objqcoef = Q.data[mask].astype(float, copy=False)
             else:
-                stacked = var.labels.stack(_sos_group=others)
-                for _, s in stacked.groupby("_sos_group"):
-                    add_sos(s.unstack("_sos_group"), sos_type, sos_dim)
+                Qt = triu(Q, format="coo")  # codespell:ignore coo
+                objqcol1 = Qt.row.astype(np.int64, copy=False)
+                objqcol2 = Qt.col.astype(np.int64, copy=False)
+                objqcoef = Qt.data.astype(float, copy=False)
+        else:
+            objqcol1 = None
+            objqcol2 = None
+            objqcoef = None
+
+        _log_stage("prepared quadratic objective terms")
+
+        integer_mask = (M.vtypes == "B") | (M.vtypes == "I")
+        is_mip = bool(np.any(integer_mask))
+
+        if is_mip:
+            entind = np.flatnonzero(integer_mask).astype(np.int64, copy=False)
+            coltype = M.vtypes[entind]
+            call_xpress(
+                "loadMIQP",
+                "loadmiqp",
+                probname="",
+                rowtype=rowtype,
+                rhs=rhs,
+                rng=None,
+                objcoef=M.c,
+                start=start,
+                collen=None,
+                rowind=rowind,
+                rowcoef=rowcoef,
+                lb=lb,
+                ub=ub,
+                objqcol1=objqcol1,
+                objqcol2=objqcol2,
+                objqcoef=objqcoef,
+                coltype=coltype,
+                entind=entind,
+                limit=None,
+                settype=None,
+                setstart=None,
+                setind=None,
+                refval=None,
+            )
+        elif objqcoef is not None:
+            call_xpress(
+                "loadQP",
+                "loadqp",
+                probname="",
+                rowtype=rowtype,
+                rhs=rhs,
+                rng=None,
+                objcoef=M.c,
+                start=start,
+                collen=None,
+                rowind=rowind,
+                rowcoef=rowcoef,
+                lb=lb,
+                ub=ub,
+                objqcol1=objqcol1,
+                objqcol2=objqcol2,
+                objqcoef=objqcoef,
+            )
+        else:
+            call_xpress(
+                "loadLP",
+                "loadlp",
+                probname="",
+                rowtype=rowtype,
+                rhs=rhs,
+                rng=None,
+                objcoef=M.c,
+                start=start,
+                collen=None,
+                rowind=rowind,
+                rowcoef=rowcoef,
+                lb=lb,
+                ub=ub,
+            )
+
+        _log_stage("loaded matrix data into Xpress")
+
+        if m.objective.sense == "max":
+            changed_sense = False
+            with contextlib.suppress(AttributeError):
+                problem.chgObjSense(xpress.ObjSense.MAXIMIZE)
+                changed_sense = True
+            if not changed_sense:
+                with contextlib.suppress(AttributeError):
+                    problem.chgobjsense(xpress.maximize)
+
+        _log_stage("set objective sense")
+
+        if explicit_coordinate_names:
+            print_variable, print_constraint = get_printers_scalar(
+                m, explicit_coordinate_names=explicit_coordinate_names
+            )
+            row_namespace = getattr(getattr(xpress, "Namespaces", None), "ROW", 1)
+            col_namespace = getattr(getattr(xpress, "Namespaces", None), "COLUMN", 2)
+
+            col_names = _name_array(M.vlabels, print_variable).tolist()
+            if col_names:
+                try:
+                    problem.addNames(col_namespace, col_names, 0, len(col_names) - 1)
+                except AttributeError:
+                    problem.addnames(col_namespace, col_names, 0, len(col_names) - 1)
+
+            row_names = _name_array(M.clabels, print_constraint).tolist()
+            if row_names:
+                try:
+                    problem.addNames(row_namespace, row_names, 0, len(row_names) - 1)
+                except AttributeError:
+                    problem.addnames(row_namespace, row_names, 0, len(row_names) - 1)
+
+        _log_stage("attached variable/constraint names")
+
+        if m.variables.sos:
+            for var_name in m.variables.sos:
+                var = m.variables.sos[var_name]
+                sos_type: int = var.attrs[SOS_TYPE_ATTR]  # type: ignore[assignment]
+                sos_dim: str = var.attrs[SOS_DIM_ATTR]  # type: ignore[assignment]
+
+                def add_sos(s: xr.DataArray, sos_type: int, sos_dim: str) -> None:
+                    s = s.squeeze()
+                    indices = s.values.astype(np.int64).flatten().tolist()
+                    weights = s.coords[sos_dim].values.tolist()
+                    problem.addSOS(indices, weights, type=sos_type)
+
+                others = [dim for dim in var.labels.dims if dim != sos_dim]
+                if not others:
+                    add_sos(var.labels, sos_type, sos_dim)
+                else:
+                    stacked = var.labels.stack(_sos_group=others)
+                    for _, s in stacked.groupby("_sos_group"):
+                        add_sos(s.unstack("_sos_group"), sos_type, sos_dim)
+            _log_stage("attached SOS constraints")
+
+        _log_stage("finished direct model build")
+    finally:
+        pass
 
     return problem
 
