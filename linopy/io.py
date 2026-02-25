@@ -5,6 +5,7 @@ Module containing all import/export functionalities.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import shutil
 import time
@@ -834,6 +835,179 @@ def to_highspy(m: Model, explicit_coordinate_names: bool = False) -> Highs:
         h.changeObjectiveSense(highspy.ObjSense.kMaximize)
 
     return h
+
+
+def to_xpress(m: Model, explicit_coordinate_names: bool = False) -> Any:
+    """
+    Export the model to xpress using native array-loading APIs.
+
+    The model is transferred through loadLP/loadQP/loadMIQP, matching the
+    underlying Xpress Optimizer C API data layout.
+    """
+    import xpress
+
+    print_variable, print_constraint = get_printers_scalar(
+        m, explicit_coordinate_names=explicit_coordinate_names
+    )
+
+    M = m.matrices
+    problem = xpress.problem()
+
+    def call_xpress(new_api: str, old_api: str, **kwargs: Any) -> None:
+        try:
+            getattr(problem, new_api)(**kwargs)
+        except AttributeError:
+            getattr(problem, old_api)(**kwargs)
+
+    A = M.A
+    if A is not None and A.nnz:
+        A = A.tocsc()
+        start = A.indptr.astype(np.int64)
+        rowind = A.indices.astype(np.int64)
+        rowcoef = A.data.astype(float)
+    else:
+        start = None
+        rowind = None
+        rowcoef = None
+
+    lb = np.where(np.isneginf(M.lb), -xpress.infinity, M.lb)
+    ub = np.where(np.isposinf(M.ub), xpress.infinity, M.ub)
+
+    if len(M.clabels):
+        row_type_map = {"<": "L", ">": "G", "=": "E"}
+        rowtype = np.vectorize(row_type_map.get)(M.sense)
+        rhs = M.b
+    else:
+        rowtype = None
+        rhs = None
+
+    Q = M.Q
+    objqcol1: np.ndarray | None
+    objqcol2: np.ndarray | None
+    objqcoef: np.ndarray | None
+    if Q is not None and Q.nnz:
+        Qt = triu(Q).tocoo()
+        objqcol1 = Qt.row.astype(np.int64)
+        objqcol2 = Qt.col.astype(np.int64)
+        objqcoef = Qt.data.astype(float)
+    else:
+        objqcol1 = None
+        objqcol2 = None
+        objqcoef = None
+
+    is_mip = bool(np.any((M.vtypes == "B") | (M.vtypes == "I")))
+
+    if is_mip:
+        entind = np.flatnonzero((M.vtypes == "B") | (M.vtypes == "I")).astype(np.int64)
+        coltype = M.vtypes[entind]
+        call_xpress(
+            "loadMIQP",
+            "loadmiqp",
+            probname="",
+            rowtype=rowtype,
+            rhs=rhs,
+            rng=None,
+            objcoef=M.c,
+            start=start,
+            collen=None,
+            rowind=rowind,
+            rowcoef=rowcoef,
+            lb=lb,
+            ub=ub,
+            objqcol1=objqcol1,
+            objqcol2=objqcol2,
+            objqcoef=objqcoef,
+            coltype=coltype,
+            entind=entind,
+            limit=None,
+            settype=None,
+            setstart=None,
+            setind=None,
+            refval=None,
+        )
+    elif objqcoef is not None:
+        call_xpress(
+            "loadQP",
+            "loadqp",
+            probname="",
+            rowtype=rowtype,
+            rhs=rhs,
+            rng=None,
+            objcoef=M.c,
+            start=start,
+            collen=None,
+            rowind=rowind,
+            rowcoef=rowcoef,
+            lb=lb,
+            ub=ub,
+            objqcol1=objqcol1,
+            objqcol2=objqcol2,
+            objqcoef=objqcoef,
+        )
+    else:
+        call_xpress(
+            "loadLP",
+            "loadlp",
+            probname="",
+            rowtype=rowtype,
+            rhs=rhs,
+            rng=None,
+            objcoef=M.c,
+            start=start,
+            collen=None,
+            rowind=rowind,
+            rowcoef=rowcoef,
+            lb=lb,
+            ub=ub,
+        )
+
+    if m.objective.sense == "max":
+        changed_sense = False
+        with contextlib.suppress(AttributeError):
+            problem.chgObjSense(xpress.ObjSense.MAXIMIZE)
+            changed_sense = True
+        if not changed_sense:
+            with contextlib.suppress(AttributeError):
+                problem.chgobjsense(xpress.maximize)
+
+    row_namespace = getattr(getattr(xpress, "Namespaces", None), "ROW", 1)
+    col_namespace = getattr(getattr(xpress, "Namespaces", None), "COLUMN", 2)
+
+    col_names = np.vectorize(print_variable)(M.vlabels).astype(object).tolist()
+    if col_names:
+        try:
+            problem.addNames(col_namespace, col_names, 0, len(col_names) - 1)
+        except AttributeError:
+            problem.addnames(col_namespace, col_names, 0, len(col_names) - 1)
+
+    row_names = np.vectorize(print_constraint)(M.clabels).astype(object).tolist()
+    if row_names:
+        try:
+            problem.addNames(row_namespace, row_names, 0, len(row_names) - 1)
+        except AttributeError:
+            problem.addnames(row_namespace, row_names, 0, len(row_names) - 1)
+
+    if m.variables.sos:
+        for var_name in m.variables.sos:
+            var = m.variables.sos[var_name]
+            sos_type: int = var.attrs[SOS_TYPE_ATTR]  # type: ignore[assignment]
+            sos_dim: str = var.attrs[SOS_DIM_ATTR]  # type: ignore[assignment]
+
+            def add_sos(s: xr.DataArray, sos_type: int, sos_dim: str) -> None:
+                s = s.squeeze()
+                indices = s.values.astype(np.int64).flatten().tolist()
+                weights = s.coords[sos_dim].values.tolist()
+                problem.addSOS(indices, weights, type=sos_type)
+
+            others = [dim for dim in var.labels.dims if dim != sos_dim]
+            if not others:
+                add_sos(var.labels, sos_type, sos_dim)
+            else:
+                stacked = var.labels.stack(_sos_group=others)
+                for _, s in stacked.groupby("_sos_group"):
+                    add_sos(s.unstack("_sos_group"), sos_type, sos_dim)
+
+    return problem
 
 
 def to_cupdlpx(m: Model, explicit_coordinate_names: bool = False) -> cupdlpxModel:

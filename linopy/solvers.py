@@ -1604,8 +1604,28 @@ class Xpress(Solver[None]):
         env: None = None,
         explicit_coordinate_names: bool = False,
     ) -> Result:
-        msg = "Direct API not implemented for Xpress"
-        raise NotImplementedError(msg)
+        m = model.to_xpress(explicit_coordinate_names=explicit_coordinate_names)
+        print_variable, print_constraint = linopy.io.get_printers_scalar(
+            model, explicit_coordinate_names=explicit_coordinate_names
+        )
+        variable_names = np.vectorize(print_variable)(model.matrices.vlabels).astype(
+            object
+        )
+        constraint_names = np.vectorize(print_constraint)(
+            model.matrices.clabels
+        ).astype(object)
+
+        return self._solve(
+            m=m,
+            solution_fn=solution_fn,
+            log_fn=log_fn,
+            warmstart_fn=warmstart_fn,
+            basis_fn=basis_fn,
+            io_api="direct",
+            sense=model.sense,
+            variable_names=variable_names,
+            constraint_names=constraint_names,
+        )
 
     def solve_problem_from_file(
         self,
@@ -1643,6 +1663,35 @@ class Xpress(Solver[None]):
         -------
         Result
         """
+        m = xpress.problem()
+
+        try:  # Try new API first
+            m.readProb(path_to_string(problem_fn))
+        except AttributeError:  # Fallback to old API
+            m.read(path_to_string(problem_fn))
+
+        return self._solve(
+            m=m,
+            solution_fn=solution_fn,
+            log_fn=log_fn,
+            warmstart_fn=warmstart_fn,
+            basis_fn=basis_fn,
+            io_api=read_io_api_from_problem_file(problem_fn),
+            sense=read_sense_from_problem_file(problem_fn),
+        )
+
+    def _solve(
+        self,
+        m: Any,
+        solution_fn: Path | None,
+        log_fn: Path | None,
+        warmstart_fn: Path | None,
+        basis_fn: Path | None,
+        io_api: str | None,
+        sense: str | None,
+        variable_names: np.ndarray | None = None,
+        constraint_names: np.ndarray | None = None,
+    ) -> Result:
         CONDITION_MAP = {
             xpress.SolStatus.NOTFOUND: "unknown",
             xpress.SolStatus.OPTIMAL: "optimal",
@@ -1650,16 +1699,6 @@ class Xpress(Solver[None]):
             xpress.SolStatus.INFEASIBLE: "infeasible",
             xpress.SolStatus.UNBOUNDED: "unbounded",
         }
-
-        io_api = read_io_api_from_problem_file(problem_fn)
-        sense = read_sense_from_problem_file(problem_fn)
-
-        m = xpress.problem()
-
-        try:  # Try new API first
-            m.readProb(path_to_string(problem_fn))
-        except AttributeError:  # Fallback to old API
-            m.read(path_to_string(problem_fn))
 
         # Set solver options - new API uses setControl per option, old API accepts dict
         if self.solver_options is not None:
@@ -1712,10 +1751,17 @@ class Xpress(Solver[None]):
         def get_solver_solution() -> Solution:
             objective = m.attributes.objval
 
-            try:  # Try new API first
-                var = m.getNameList(xpress_Namespaces.COLUMN, 0, m.attributes.cols - 1)
-            except AttributeError:  # Fallback to old API
-                var = m.getnamelist(xpress_Namespaces.COLUMN, 0, m.attributes.cols - 1)
+            if variable_names is not None:
+                var = variable_names
+            else:
+                try:  # Try new API first
+                    var = m.getNameList(
+                        xpress_Namespaces.COLUMN, 0, m.attributes.cols - 1
+                    )
+                except AttributeError:  # Fallback to old API
+                    var = m.getnamelist(
+                        xpress_Namespaces.COLUMN, 0, m.attributes.cols - 1
+                    )
             sol = pd.Series(m.getSolution(), index=var, dtype=float)
 
             try:
@@ -1724,14 +1770,17 @@ class Xpress(Solver[None]):
                 except AttributeError:  # Fallback to old API
                     _dual = m.getDual()
 
-                try:  # Try new API first
-                    constraints = m.getNameList(
-                        xpress_Namespaces.ROW, 0, m.attributes.rows - 1
-                    )
-                except AttributeError:  # Fallback to old API
-                    constraints = m.getnamelist(
-                        xpress_Namespaces.ROW, 0, m.attributes.rows - 1
-                    )
+                if constraint_names is not None:
+                    constraints = constraint_names
+                else:
+                    try:  # Try new API first
+                        constraints = m.getNameList(
+                            xpress_Namespaces.ROW, 0, m.attributes.rows - 1
+                        )
+                    except AttributeError:  # Fallback to old API
+                        constraints = m.getnamelist(
+                            xpress_Namespaces.ROW, 0, m.attributes.rows - 1
+                        )
                 dual = pd.Series(_dual, index=constraints, dtype=float)
             except (xpress.SolverError, xpress.ModelError, SystemError):
                 logger.warning("Dual values of MILP couldn't be parsed")
