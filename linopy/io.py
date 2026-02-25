@@ -864,6 +864,14 @@ def to_xpress(
     t_start = time.perf_counter()
     t_stage = t_start
     problem = xpress.problem()
+    int32_max = np.iinfo(np.int32).max
+    use_int32_indices = (
+        len(M.vlabels) <= int32_max
+        and len(M.clabels) <= int32_max
+        and (M.A is None or M.A.nnz <= int32_max)
+        and (M.Q is None or M.Q.nnz <= int32_max)
+    )
+    index_dtype = np.int32 if use_int32_indices else np.int64
 
     def _emit_progress_message(message: str) -> None:
         if not progress:
@@ -905,8 +913,8 @@ def to_xpress(
         if A is not None and A.nnz:
             if A.format != "csc":
                 A = A.tocsc()
-            start = A.indptr.astype(np.int64, copy=False)
-            rowind = A.indices.astype(np.int64, copy=False)
+            start = A.indptr.astype(index_dtype, copy=False)
+            rowind = A.indices.astype(index_dtype, copy=False)
             rowcoef = A.data.astype(float, copy=False)
         else:
             start = None
@@ -934,7 +942,7 @@ def to_xpress(
             rowtype = np.full(M.sense.shape, "E", dtype="U1")
             rowtype[M.sense == "<"] = "L"
             rowtype[M.sense == ">"] = "G"
-            rhs = M.b
+            rhs = np.asarray(M.b, dtype=float)
         else:
             rowtype = None
             rhs = None
@@ -948,13 +956,13 @@ def to_xpress(
         if Q is not None and Q.nnz:
             if Q.format == "coo":  # codespell:ignore coo
                 mask = Q.row <= Q.col
-                objqcol1 = Q.row[mask].astype(np.int64, copy=False)
-                objqcol2 = Q.col[mask].astype(np.int64, copy=False)
+                objqcol1 = Q.row[mask].astype(index_dtype, copy=False)
+                objqcol2 = Q.col[mask].astype(index_dtype, copy=False)
                 objqcoef = Q.data[mask].astype(float, copy=False)
             else:
                 Qt = triu(Q, format="coo")  # codespell:ignore coo
-                objqcol1 = Qt.row.astype(np.int64, copy=False)
-                objqcol2 = Qt.col.astype(np.int64, copy=False)
+                objqcol1 = Qt.row.astype(index_dtype, copy=False)
+                objqcol2 = Qt.col.astype(index_dtype, copy=False)
                 objqcoef = Qt.data.astype(float, copy=False)
         else:
             objqcol1 = None
@@ -965,9 +973,10 @@ def to_xpress(
 
         integer_mask = (M.vtypes == "B") | (M.vtypes == "I")
         is_mip = bool(np.any(integer_mask))
+        objcoef = np.asarray(M.c, dtype=float)
 
         if is_mip:
-            entind = np.flatnonzero(integer_mask).astype(np.int64, copy=False)
+            entind = np.flatnonzero(integer_mask).astype(index_dtype, copy=False)
             coltype = M.vtypes[entind]
             call_xpress(
                 "loadMIQP",
@@ -976,7 +985,7 @@ def to_xpress(
                 rowtype=rowtype,
                 rhs=rhs,
                 rng=None,
-                objcoef=M.c,
+                objcoef=objcoef,
                 start=start,
                 collen=None,
                 rowind=rowind,
@@ -1002,7 +1011,7 @@ def to_xpress(
                 rowtype=rowtype,
                 rhs=rhs,
                 rng=None,
-                objcoef=M.c,
+                objcoef=objcoef,
                 start=start,
                 collen=None,
                 rowind=rowind,
@@ -1021,7 +1030,7 @@ def to_xpress(
                 rowtype=rowtype,
                 rhs=rhs,
                 rng=None,
-                objcoef=M.c,
+                objcoef=objcoef,
                 start=start,
                 collen=None,
                 rowind=rowind,
@@ -1074,7 +1083,9 @@ def to_xpress(
 
                 def add_sos(s: xr.DataArray, sos_type: int, sos_dim: str) -> None:
                     s = s.squeeze()
-                    indices = s.values.astype(np.int64).flatten().tolist()
+                    indices = (
+                        s.values.astype(index_dtype, copy=False).flatten().tolist()
+                    )
                     weights = s.coords[sos_dim].values.tolist()
                     problem.addSOS(indices, weights, type=sos_type)
 

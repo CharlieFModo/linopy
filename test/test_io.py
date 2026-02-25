@@ -266,6 +266,11 @@ def test_to_xpress_loadlp_and_maxsense(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "chgObjSense" in method_names
     assert method_names.count("addNames") == 2
 
+    call_map = {name: kwargs for name, kwargs in fake_problem.calls}
+    lp_kwargs = call_map["loadLP"]
+    assert lp_kwargs["start"].dtype == np.int32
+    assert lp_kwargs["rowind"].dtype == np.int32
+
 
 def test_to_xpress_loadmiqp(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_problem = _install_fake_xpress(monkeypatch)
@@ -283,6 +288,9 @@ def test_to_xpress_loadmiqp(monkeypatch: pytest.MonkeyPatch) -> None:
     miqp_kwargs = call_map["loadMIQP"]
     assert miqp_kwargs["entind"] is not None
     assert miqp_kwargs["objqcoef"] is not None
+    assert miqp_kwargs["entind"].dtype == np.int32
+    assert miqp_kwargs["objqcol1"].dtype == np.int32
+    assert miqp_kwargs["objqcol2"].dtype == np.int32
     assert "addNames" not in call_map
 
 
