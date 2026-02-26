@@ -864,12 +864,16 @@ def to_xpress(
     t_start = time.perf_counter()
     t_stage = t_start
     problem = xpress.problem()
+    vlabels = M.vlabels
+    clabels = M.clabels
+    A = M.A
+    Q = M.Q
     int32_max = np.iinfo(np.int32).max
     use_int32_indices = (
-        len(M.vlabels) <= int32_max
-        and len(M.clabels) <= int32_max
-        and (M.A is None or M.A.nnz <= int32_max)
-        and (M.Q is None or M.Q.nnz <= int32_max)
+        len(vlabels) <= int32_max
+        and len(clabels) <= int32_max
+        and (A is None or A.nnz <= int32_max)
+        and (Q is None or Q.nnz <= int32_max)
     )
     index_dtype = np.int32 if use_int32_indices else np.int64
 
@@ -882,9 +886,9 @@ def to_xpress(
 
     _emit_progress_message(
         " Xpress direct IO: building model "
-        f"(nvars={len(M.vlabels)}, ncons={len(M.clabels)}, "
-        f"annz={int(M.A.nnz) if M.A is not None else 0}, "
-        f"qnnz={int(M.Q.nnz) if M.Q is not None else 0}, "
+        f"(nvars={len(vlabels)}, ncons={len(clabels)}, "
+        f"annz={int(A.nnz) if A is not None else 0}, "
+        f"qnnz={int(Q.nnz) if Q is not None else 0}, "
         f"explicit_names={explicit_coordinate_names})"
     )
 
@@ -909,7 +913,6 @@ def to_xpress(
         t_stage = now
 
     try:
-        A = M.A
         if A is not None and A.nnz:
             if A.format != "csc":
                 A = A.tocsc()
@@ -938,10 +941,11 @@ def to_xpress(
 
         _log_stage("prepared variable bounds")
 
-        if len(M.clabels):
-            rowtype = np.full(M.sense.shape, "E", dtype="U1")
-            rowtype[M.sense == "<"] = "L"
-            rowtype[M.sense == ">"] = "G"
+        if len(clabels):
+            sense = M.sense
+            rowtype = np.full(sense.shape, "E", dtype="U1")
+            rowtype[sense == "<"] = "L"
+            rowtype[sense == ">"] = "G"
             rhs = np.asarray(M.b, dtype=float)
         else:
             rowtype = None
@@ -949,7 +953,6 @@ def to_xpress(
 
         _log_stage("prepared row senses and rhs")
 
-        Q = M.Q
         objqcol1: np.ndarray | None
         objqcol2: np.ndarray | None
         objqcoef: np.ndarray | None
@@ -971,13 +974,14 @@ def to_xpress(
 
         _log_stage("prepared quadratic objective terms")
 
-        integer_mask = (M.vtypes == "B") | (M.vtypes == "I")
+        vtypes = M.vtypes
+        integer_mask = (vtypes == "B") | (vtypes == "I")
         is_mip = bool(np.any(integer_mask))
         objcoef = np.asarray(M.c, dtype=float)
 
         if is_mip:
             entind = np.flatnonzero(integer_mask).astype(index_dtype, copy=False)
-            coltype = M.vtypes[entind]
+            coltype = vtypes[entind]
             call_xpress(
                 "loadMIQP",
                 "loadmiqp",
@@ -1059,14 +1063,14 @@ def to_xpress(
             row_namespace = getattr(getattr(xpress, "Namespaces", None), "ROW", 1)
             col_namespace = getattr(getattr(xpress, "Namespaces", None), "COLUMN", 2)
 
-            col_names = _name_array(M.vlabels, print_variable).tolist()
+            col_names = _name_array(vlabels, print_variable).tolist()
             if col_names:
                 try:
                     problem.addNames(col_namespace, col_names, 0, len(col_names) - 1)
                 except AttributeError:
                     problem.addnames(col_namespace, col_names, 0, len(col_names) - 1)
 
-            row_names = _name_array(M.clabels, print_constraint).tolist()
+            row_names = _name_array(clabels, print_constraint).tolist()
             if row_names:
                 try:
                     problem.addNames(row_namespace, row_names, 0, len(row_names) - 1)
