@@ -1165,14 +1165,27 @@ class Constraints:
             data = np.array([], dtype=float)
 
         if filter_missings:
-            cons = self.flat
-            vars = self.model.variables.flat
-            shape = (cons.key.max() + 1, vars.key.max() + 1)
-
             cons_map = np.full(self.model._cCounter, -1, dtype=np.int64)
-            cons_map[cons.labels.to_numpy()] = cons.key.to_numpy()
+            next_con_key = 0
+            for _, constraint in self.items():
+                labels = constraint.labels.values.reshape(-1)
+                labels = labels[labels != -1]
+                n = labels.size
+                if n:
+                    cons_map[labels] = np.arange(next_con_key, next_con_key + n)
+                    next_con_key += n
+
             vars_map = np.full(self.model._xCounter, -1, dtype=np.int64)
-            vars_map[vars.labels.to_numpy()] = vars.key.to_numpy()
+            next_var_key = 0
+            for _, variable in self.model.variables.items():
+                labels = variable.labels.values.reshape(-1)
+                labels = labels[labels != -1]
+                n = labels.size
+                if n:
+                    vars_map[labels] = np.arange(next_var_key, next_var_key + n)
+                    next_var_key += n
+
+            shape = (next_con_key, next_var_key)
 
             row = cons_map[row]
             col = vars_map[col]

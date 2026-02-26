@@ -141,8 +141,7 @@ class MatrixAccessor:
         m = self._parent
         if not len(m.constraints):
             return None
-        A: csc_matrix = m.constraints.to_matrix(filter_missings=False)
-        return A[self.clabels][:, self.vlabels]
+        return m.constraints.to_matrix(filter_missings=True)
 
     @property
     def sense(self) -> ndarray:
