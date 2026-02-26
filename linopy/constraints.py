@@ -1091,6 +1091,34 @@ class Constraints:
         df["key"] = df.labels.map(map_labels)
         return df
 
+    def to_polars(self) -> pl.DataFrame:
+        """
+        Convert all constraints to a single polars DataFrame.
+
+        The resulting dataframe is a long format with columns
+        `labels`, `coeffs`, `vars`, `rhs`, `sign`, `key`.
+        """
+        dfs = [self[k].to_polars() for k in self]
+        if not dfs:
+            return pl.DataFrame(
+                {
+                    "labels": pl.Series([], dtype=pl.Int64),
+                    "coeffs": pl.Series([], dtype=pl.Float64),
+                    "vars": pl.Series([], dtype=pl.Int64),
+                    "sign": pl.Series([], dtype=pl.String),
+                    "rhs": pl.Series([], dtype=pl.Float64),
+                    "key": pl.Series([], dtype=pl.Int64),
+                }
+            )
+
+        df = pl.concat(dfs, how="vertical_relaxed")
+        labels = (
+            df.select("labels")
+            .unique(maintain_order=True)
+            .with_row_index(name="key", offset=0)
+        )
+        return df.join(labels, on="labels", how="left")
+
     def to_matrix(self, filter_missings: bool = True) -> scipy.sparse.csc_matrix:
         """
         Construct a constraint matrix in sparse format.
@@ -1098,24 +1126,60 @@ class Constraints:
         Missing values, i.e. -1 in labels and vars, are ignored filtered
         out.
         """
-        # TODO: rename "filter_missings" to "~labels_as_coordinates"
-        cons = self.flat
-
         if not len(self):
             raise ValueError("No constraints available to convert to matrix.")
 
+        # Build sparse triplets directly from NumPy arrays to avoid dataframe overhead.
+        row_parts: list[np.ndarray] = []
+        col_parts: list[np.ndarray] = []
+        data_parts: list[np.ndarray] = []
+
+        for _, constraint in self.items():
+            labels = constraint.labels.values.reshape(-1)
+            vars_arr = constraint.vars.values
+            coeffs_arr = constraint.coeffs.values
+
+            term_axis = constraint.vars.get_axis_num(constraint.term_dim)
+            if term_axis != vars_arr.ndim - 1:
+                vars_arr = np.moveaxis(vars_arr, term_axis, -1)
+                coeffs_arr = np.moveaxis(coeffs_arr, term_axis, -1)
+
+            nterm = vars_arr.shape[-1]
+            row = np.repeat(labels, nterm)
+            col = vars_arr.reshape(-1)
+            data = coeffs_arr.reshape(-1)
+
+            mask = (row != -1) & (col != -1) & (data != 0)
+            if mask.any():
+                row_parts.append(row[mask])
+                col_parts.append(col[mask])
+                data_parts.append(data[mask])
+
+        if row_parts:
+            row = np.concatenate(row_parts)
+            col = np.concatenate(col_parts)
+            data = np.concatenate(data_parts)
+        else:
+            row = np.array([], dtype=np.int64)
+            col = np.array([], dtype=np.int64)
+            data = np.array([], dtype=float)
+
         if filter_missings:
+            cons = self.flat
             vars = self.model.variables.flat
             shape = (cons.key.max() + 1, vars.key.max() + 1)
-            cons["vars"] = cons.vars.map(vars.set_index("labels").key)
-            return scipy.sparse.csc_matrix(
-                (cons.coeffs, (cons.key, cons.vars)), shape=shape
-            )
-        else:
-            shape = self.model.shape
-            return scipy.sparse.csc_matrix(
-                (cons.coeffs, (cons.labels, cons.vars)), shape=shape
-            )
+
+            cons_map = np.full(self.model._cCounter, -1, dtype=np.int64)
+            cons_map[cons.labels.to_numpy()] = cons.key.to_numpy()
+            vars_map = np.full(self.model._xCounter, -1, dtype=np.int64)
+            vars_map[vars.labels.to_numpy()] = vars.key.to_numpy()
+
+            row = cons_map[row]
+            col = vars_map[col]
+            return scipy.sparse.csc_matrix((data, (row, col)), shape=shape)
+
+        shape = self.model.shape
+        return scipy.sparse.csc_matrix((data, (row, col)), shape=shape)
 
     def reset_dual(self) -> None:
         """
