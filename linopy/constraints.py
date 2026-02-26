@@ -1129,13 +1129,28 @@ class Constraints:
         if not len(self):
             raise ValueError("No constraints available to convert to matrix.")
 
+        def _build_dense_key_map(
+            arrays: list[np.ndarray], total_size: int
+        ) -> tuple[np.ndarray, int]:
+            mapping = np.full(total_size, -1, dtype=np.int64)
+            next_key = 0
+            for labels in arrays:
+                labels = labels[labels != -1]
+                n = labels.size
+                if n:
+                    mapping[labels] = np.arange(next_key, next_key + n)
+                    next_key += n
+            return mapping, next_key
+
         # Build sparse triplets directly from NumPy arrays to avoid dataframe overhead.
         row_parts: list[np.ndarray] = []
         col_parts: list[np.ndarray] = []
         data_parts: list[np.ndarray] = []
+        constraint_labels: list[np.ndarray] = []
 
         for _, constraint in self.items():
             labels = constraint.labels.values.reshape(-1)
+            constraint_labels.append(labels)
             vars_arr = constraint.vars.values
             coeffs_arr = constraint.coeffs.values
 
@@ -1165,30 +1180,26 @@ class Constraints:
             data = np.array([], dtype=float)
 
         if filter_missings:
-            cons_map = np.full(self.model._cCounter, -1, dtype=np.int64)
-            next_con_key = 0
-            for _, constraint in self.items():
-                labels = constraint.labels.values.reshape(-1)
-                labels = labels[labels != -1]
-                n = labels.size
-                if n:
-                    cons_map[labels] = np.arange(next_con_key, next_con_key + n)
-                    next_con_key += n
-
-            vars_map = np.full(self.model._xCounter, -1, dtype=np.int64)
-            next_var_key = 0
-            for _, variable in self.model.variables.items():
-                labels = variable.labels.values.reshape(-1)
-                labels = labels[labels != -1]
-                n = labels.size
-                if n:
-                    vars_map[labels] = np.arange(next_var_key, next_var_key + n)
-                    next_var_key += n
+            cons_map, next_con_key = _build_dense_key_map(
+                constraint_labels, self.model._cCounter
+            )
+            vars_map, next_var_key = _build_dense_key_map(
+                [
+                    var.labels.values.reshape(-1)
+                    for _, var in self.model.variables.items()
+                ],
+                self.model._xCounter,
+            )
 
             shape = (next_con_key, next_var_key)
 
             row = cons_map[row]
             col = vars_map[col]
+            keep = (row != -1) & (col != -1)
+            if not keep.all():
+                row = row[keep]
+                col = col[keep]
+                data = data[keep]
             return scipy.sparse.csc_matrix((data, (row, col)), shape=shape)
 
         shape = self.model.shape

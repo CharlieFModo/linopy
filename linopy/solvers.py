@@ -1605,12 +1605,16 @@ class Xpress(Solver[None]):
         env: None = None,
         explicit_coordinate_names: bool = False,
     ) -> Result:
-        variable_names: np.ndarray | None = None
-        constraint_names: np.ndarray | None = None
-        if not explicit_coordinate_names:
-            matrices = model.matrices
-            variable_names = np.asarray(matrices.vlabels)
-            constraint_names = np.asarray(matrices.clabels)
+        variable_names = (
+            np.asarray(model.matrices.vlabels)
+            if not explicit_coordinate_names
+            else None
+        )
+        constraint_names = (
+            np.asarray(model.matrices.clabels)
+            if not explicit_coordinate_names
+            else None
+        )
 
         build_start = time.perf_counter()
         logger.info(" Start building Xpress direct model")
@@ -1700,6 +1704,16 @@ class Xpress(Solver[None]):
         variable_names: np.ndarray | None = None,
         constraint_names: np.ndarray | None = None,
     ) -> Result:
+        def _get_names(
+            namespace: int, count: int, cached: np.ndarray | None = None
+        ) -> np.ndarray | list[str]:
+            if cached is not None:
+                return cached
+            try:  # Try new API first
+                return m.getNameList(namespace, 0, count - 1)
+            except AttributeError:  # Fallback to old API
+                return m.getnamelist(namespace, 0, count - 1)
+
         CONDITION_MAP = {
             xpress.SolStatus.NOTFOUND: "unknown",
             xpress.SolStatus.OPTIMAL: "optimal",
@@ -1764,17 +1778,9 @@ class Xpress(Solver[None]):
         def get_solver_solution() -> Solution:
             objective = m.attributes.objval
 
-            if variable_names is not None:
-                var = variable_names
-            else:
-                try:  # Try new API first
-                    var = m.getNameList(
-                        xpress_Namespaces.COLUMN, 0, m.attributes.cols - 1
-                    )
-                except AttributeError:  # Fallback to old API
-                    var = m.getnamelist(
-                        xpress_Namespaces.COLUMN, 0, m.attributes.cols - 1
-                    )
+            var = _get_names(
+                xpress_Namespaces.COLUMN, m.attributes.cols, cached=variable_names
+            )
             sol = pd.Series(m.getSolution(), index=var, dtype=float)
 
             try:
@@ -1783,17 +1789,11 @@ class Xpress(Solver[None]):
                 except AttributeError:  # Fallback to old API
                     _dual = m.getDual()
 
-                if constraint_names is not None:
-                    constraints = constraint_names
-                else:
-                    try:  # Try new API first
-                        constraints = m.getNameList(
-                            xpress_Namespaces.ROW, 0, m.attributes.rows - 1
-                        )
-                    except AttributeError:  # Fallback to old API
-                        constraints = m.getnamelist(
-                            xpress_Namespaces.ROW, 0, m.attributes.rows - 1
-                        )
+                constraints = _get_names(
+                    xpress_Namespaces.ROW,
+                    m.attributes.rows,
+                    cached=constraint_names,
+                )
                 dual = pd.Series(_dual, index=constraints, dtype=float)
             except (xpress.SolverError, xpress.ModelError, SystemError):
                 logger.warning("Dual values of MILP couldn't be parsed")

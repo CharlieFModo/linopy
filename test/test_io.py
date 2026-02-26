@@ -277,7 +277,7 @@ def test_to_xpress_loadmiqp(monkeypatch: pytest.MonkeyPatch) -> None:
 
     m = Model()
     x = m.add_variables(lower=0, upper=10, name="x")
-    y = m.add_variables(lower=0, upper=1, binary=True, name="y")
+    y = m.add_variables(binary=True, name="y")
     m.add_constraints(x + y, LESS_EQUAL, 3, name="c")
     m.add_objective(x * x + 2 * y)
 
